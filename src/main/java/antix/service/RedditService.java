@@ -1,5 +1,6 @@
 package antix.service;
 
+import antix.model.SocialMediaPost;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -20,11 +21,11 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Reddit search via official OAuth API with a resilient fallback to public JSON.
- * Requires env/properties:
- *   reddit.client-id
- *   reddit.client-secret
- *   reddit.user-agent
+ * Recherche Reddit via l'API officielle OAuth avec repli vers l'API publique JSON.
+ * Variables attendues (env/propriétés Spring) :
+ *   reddit.client-id  / ${REDDIT_CLIENT_ID}
+ *   reddit.client-secret / ${REDDIT_CLIENT_SECRET}
+ *   reddit.user-agent / ${REDDIT_USER_AGENT}
  */
 @Service
 public class RedditService implements SocialMediaService {
@@ -33,8 +34,8 @@ public class RedditService implements SocialMediaService {
     private static final String OAUTH_SEARCH_URL = "https://oauth.reddit.com/search";
     private static final String PUBLIC_SEARCH_URL = "https://www.reddit.com/search.json";
 
-    private final HttpClient http;
-    private final ObjectMapper mapper;
+    private final HttpClient http = HttpClient.newHttpClient();
+    private final ObjectMapper mapper = new ObjectMapper();
 
     private final String clientId;
     private final String clientSecret;
@@ -45,46 +46,47 @@ public class RedditService implements SocialMediaService {
             @Value("${reddit.client-secret:${REDDIT_CLIENT_SECRET:}}") String clientSecret,
             @Value("${reddit.user-agent:${REDDIT_USER_AGENT:AntixBot/1.0 (+https://example.com)}}") String userAgent
     ) {
-        this.http = HttpClient.newHttpClient();
-        this.mapper = new ObjectMapper();
         this.clientId = clientId == null ? "" : clientId.trim();
         this.clientSecret = clientSecret == null ? "" : clientSecret.trim();
-        this.userAgent = userAgent == null ? "AntixBot/1.0 (+https://example.com)" : userAgent.trim();
+        this.userAgent = (userAgent == null || userAgent.isBlank())
+                ? "AntixBot/1.0 (+https://example.com)"
+                : userAgent.trim();
     }
 
-    // ---- Public API ---------------------------------------------------------
+    // ========= Implémentation SocialMediaService =========
 
     @Override
-    public List<SocialMediaPost> search(String query) {
-        return search(query, 20);
-    }
+    public List<SocialMediaPost> fetchPostsFromTag(String tag, int limit) {
+        if (tag == null || tag.isBlank()) return List.of();
+        int capped = Math.max(1, Math.min(limit <= 0 ? 20 : limit, 100));
 
-    public List<SocialMediaPost> search(String query, int limit) {
-        if (query == null || query.isBlank()) return List.of();
-
-        // 1) Essayer OAuth (fiable en prod)
+        // 1) Essayer OAuth (plus fiable en prod cloud)
         if (hasCredentials()) {
             try {
                 String token = getAppOnlyToken()
-                        .orElseThrow(() -> new IllegalStateException("Reddit OAuth: token absent"));
-                List<SocialMediaPost> posts = searchWithOAuth(query, limit, token);
+                        .orElseThrow(() -> new IllegalStateException("Reddit OAuth: access_token manquant"));
+                List<SocialMediaPost> posts = searchWithOAuth(tag, capped, token);
                 if (!posts.isEmpty()) return posts;
             } catch (Exception e) {
-                // journaliser et tomber en repli
-                System.err.println("[RedditService] OAuth search failed, falling back to public API: " + e.getMessage());
+                System.err.println("[RedditService] OAuth search failed, fallback to public JSON: " + e.getMessage());
             }
         }
 
-        // 2) Fallback API publique JSON (peut renvoyer 429 en cloud)
+        // 2) Repli API publique JSON
         try {
-            return searchPublicJson(query, limit);
+            return searchPublicJson(tag, Math.min(capped, 50));
         } catch (Exception e) {
             System.err.println("[RedditService] Public JSON search failed: " + e.getMessage());
             return List.of();
         }
     }
 
-    // ---- OAuth flow ---------------------------------------------------------
+    @Override
+    public String getPlatformName() {
+        return "reddit";
+    }
+
+    // ======================= OAuth =======================
 
     private boolean hasCredentials() {
         return !clientId.isBlank() && !clientSecret.isBlank();
@@ -94,7 +96,7 @@ public class RedditService implements SocialMediaService {
         String credentials = Base64.getEncoder()
                 .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
 
-        String form = "grant_type=client_credentials"; // app-only
+        String form = "grant_type=client_credentials";
         HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
                 .header(HttpHeaders.AUTHORIZATION, "Basic " + credentials)
                 .header(HttpHeaders.USER_AGENT, userAgent)
@@ -113,10 +115,12 @@ public class RedditService implements SocialMediaService {
         }
     }
 
-    private List<SocialMediaPost> searchWithOAuth(String query, int limit, String bearerToken) throws IOException, InterruptedException {
+    private List<SocialMediaPost> searchWithOAuth(String query, int limit, String bearerToken)
+            throws IOException, InterruptedException {
+
         String url = OAUTH_SEARCH_URL
                 + "?q=" + url(query)
-                + "&limit=" + Math.max(1, Math.min(limit, 100))
+                + "&limit=" + limit
                 + "&sort=relevance&type=link&restrict_sr=false";
 
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
@@ -126,26 +130,26 @@ public class RedditService implements SocialMediaService {
                 .build();
 
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-
         if (resp.statusCode() == 401 || resp.statusCode() == 403) {
-            throw new IllegalStateException("Unauthorized/Forbidden: check Reddit credentials & scopes");
+            throw new IllegalStateException("Unauthorized/Forbidden Reddit API (vérifie client/secret/scopes)");
         }
         if (resp.statusCode() == 429) {
-            throw new IllegalStateException("Rate limited (429) by Reddit API");
+            throw new IllegalStateException("Rate limited (429) par Reddit API");
         }
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new IllegalStateException("Reddit OAuth search failed: " + resp.statusCode());
         }
-
         return parseRedditListing(resp.body());
     }
 
-    // ---- Public JSON fallback ----------------------------------------------
+    // ==================== Public JSON fallback ====================
 
-    private List<SocialMediaPost> searchPublicJson(String query, int limit) throws IOException, InterruptedException {
+    private List<SocialMediaPost> searchPublicJson(String query, int limit)
+            throws IOException, InterruptedException {
+
         String url = PUBLIC_SEARCH_URL
                 + "?q=" + url(query)
-                + "&limit=" + Math.max(1, Math.min(limit, 50))
+                + "&limit=" + limit
                 + "&sort=relevance&type=link&restrict_sr=false";
 
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
@@ -154,18 +158,16 @@ public class RedditService implements SocialMediaService {
                 .build();
 
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-
         if (resp.statusCode() == 429) {
-            throw new IllegalStateException("Rate limited (429) by reddit.com public JSON");
+            throw new IllegalStateException("Rate limited (429) par reddit.com public JSON");
         }
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new IllegalStateException("Public JSON search failed: " + resp.statusCode());
         }
-
         return parseRedditListing(resp.body());
     }
 
-    // ---- Parsing ------------------------------------------------------------
+    // ========================= Parsing =========================
 
     private List<SocialMediaPost> parseRedditListing(String body) throws IOException {
         JsonNode root = mapper.readTree(body);
@@ -175,6 +177,7 @@ public class RedditService implements SocialMediaService {
         if (children.isArray()) {
             for (JsonNode child : children) {
                 JsonNode d = child.path("data");
+                String id = text(d, "id");
                 String title = text(d, "title");
                 String selftext = text(d, "selftext");
                 String author = text(d, "author");
@@ -186,20 +189,23 @@ public class RedditService implements SocialMediaService {
                 int comments = d.path("num_comments").asInt(0);
                 String thumb = text(d, "thumbnail");
 
-                // TODO: adapte ce mapping selon ta classe SocialMediaPost
-                SocialMediaPost post = SocialMediaPost.builder()
-                        .platform("reddit")
-                        .author(author)
-                        .title(title)
-                        .content(selftext != null && !selftext.isBlank() ? selftext : title)
-                        .link(permalink)
-                        .mediaUrl(isHttpUrl(thumb) ? thumb : null)
-                        .externalUrl(url)
-                        .score(score)
-                        .commentsCount(comments)
-                        .subgroup(subreddit)                 // ex: r/java
-                        .publishedAt(createdUtc > 0 ? Instant.ofEpochSecond(createdUtc) : null)
-                        .build();
+                SocialMediaPost post = new SocialMediaPost();
+                post.setId(id);
+                post.setPlatform("reddit");
+                post.setTitle(title);
+                post.setAuthor(author != null ? "u/" + author : null);
+                post.setSubreddit(subreddit);
+                post.setPermalink(permalink);
+                post.setPostUrl(url);
+                post.setContent((selftext != null && !selftext.isBlank()) ? selftext : title);
+                post.setScore(score);
+                post.setNumComments(comments);
+                post.setCreatedUtc(createdUtc);
+                // image miniature si valide
+                if (isHttpUrl(thumb)) {
+                    // si tu as un champ mediaUrl dans ton modèle, ajoute-le ici
+                    // ex: post.setMediaUrl(thumb);
+                }
 
                 out.add(post);
             }
@@ -207,7 +213,7 @@ public class RedditService implements SocialMediaService {
         return out;
     }
 
-    // ---- Utils --------------------------------------------------------------
+    // ========================= Utils =========================
 
     private static String url(String s) {
         return URLEncoder.encode(s, StandardCharsets.UTF_8);
