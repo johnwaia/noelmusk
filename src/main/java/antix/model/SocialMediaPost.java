@@ -3,30 +3,34 @@ package antix.model;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.Objects;
+import java.util.*;
 
-/**
- * Modèle simple pour afficher des posts (Reddit, Mastodon, etc.) dans Vaadin.
- * Compatible avec le code existant (setters/getters utilisés dans tes services et commandes).
- */
 public class SocialMediaPost {
 
-    // --- Champs principaux ---
-    private String id;             // ex: t3_xxxxx (reddit) ou URL unique
-    private String platform;       // "reddit" | "mastodon" | ...
+    // --- Champs de base (utilisés partout) ---
+    private String id;
+    private String platform;      // "reddit", "mastodon", ...
     private String title;
-    private String author;         // ex: "u/foo" ou "@bar@instance"
-    private String subreddit;      // pour Reddit (peut rester vide)
-    private String permalink;      // lien interne (reddit: /r/.../comments/...)
-    private String postUrl;        // lien externe si présent
-    private String content;        // HTML (ton UI utilise innerHTML)
-    private int score;             // upvotes / favs
-    private int numComments;       // nb de réponses/commentaires
-    private long createdUtc;       // epoch seconds (utilisé pour le tri & affichage)
+    private String author;        // "u/foo", "@bar@instance", ...
+    private String subreddit;     // pour Reddit
+    private String permalink;     // lien interne (reddit)
+    private String postUrl;       // lien externe si dispo
+    private String content;       // texte/HTML
+    private int score;            // upvotes/likes
+    private int numComments;      // replies/comments
+    private long createdUtc;      // epoch seconds
 
-    // --- Getters/Setters "bean" (Vaadin Grid les détecte) ---
-    public SocialMediaPost() {}
+    // Champs pour features UI
+    private List<String> tags = new ArrayList<>();
+    private int likeCount = -1;   // -1 => déduire de score
+    private int shareCount = 0;
 
+    // Optionnel: logo & couleurs spécifiques
+    private String logoPath;      // peut rester null
+    private String badgeColor;    // "#RRGGBB" ou "var(--...)" etc.
+    private String badgeTextColor;
+
+    // ======= Getters/Setters classiques =======
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
 
@@ -60,14 +64,46 @@ public class SocialMediaPost {
     public long getCreatedUtc() { return createdUtc; }
     public void setCreatedUtc(long createdUtc) { this.createdUtc = createdUtc; }
 
-    // --- Méthodes utilitaires attendues par ton UI/commandes ---
-
-    /** Date sous forme Instant (utilisé pour le tri dans MainView). */
-    public Instant getCreatedAt() {
-        return createdUtc > 0 ? Instant.ofEpochSecond(createdUtc) : null;
+    public List<String> getTags() { return Collections.unmodifiableList(tags); }
+    public void setTags(List<String> tags) {
+        this.tags = (tags == null) ? new ArrayList<>() : new ArrayList<>(tags);
     }
 
-    /** Affichage "sympa" pour l’UI (MainView appelle getDisplayName). */
+    public int getLikeCount() { return likeCount >= 0 ? likeCount : score; }
+    public void setLikeCount(int likeCount) { this.likeCount = likeCount; }
+
+    public int getShareCount() { return shareCount; }
+    public void setShareCount(int shareCount) { this.shareCount = shareCount; }
+
+    public String getLogoPath() { return (logoPath != null) ? logoPath : defaultLogoForPlatform(); }
+    public void setLogoPath(String logoPath) { this.logoPath = logoPath; }
+
+    public String getBadgeColor() { return (badgeColor != null) ? badgeColor : defaultBadgeColor(); }
+    public void setBadgeColor(String badgeColor) { this.badgeColor = badgeColor; }
+
+    public String getBadgeTextColor() { return (badgeTextColor != null) ? badgeTextColor : "#ffffff"; }
+    public void setBadgeTextColor(String badgeTextColor) { this.badgeTextColor = badgeTextColor; }
+
+    // ======= Helpers attendus par PlatformBadge / GridUtils / Commands =======
+    public String getPlatformDisplayName() {
+        if ("reddit".equalsIgnoreCase(platform)) return "Reddit";
+        if ("mastodon".equalsIgnoreCase(platform)) return "Mastodon";
+        return platform != null ? capitalize(platform) : "Social";
+    }
+
+    public String getPlatformShortCode() {
+        if ("reddit".equalsIgnoreCase(platform)) return "RD";
+        if ("mastodon".equalsIgnoreCase(platform)) return "MA";
+        return "SO";
+    }
+
+    public String getUrl() {
+        return postUrl != null && !postUrl.isBlank() ? postUrl : permalink;
+    }
+
+    public int getRepliesCount() { return numComments; }
+
+    // Texte d’affichage
     public String getDisplayName() {
         if (author != null && subreddit != null && !subreddit.isBlank()) {
             return author + " in r/" + subreddit;
@@ -75,56 +111,40 @@ public class SocialMediaPost {
         return author != null ? author : (title != null ? title : "Post");
     }
 
-    /** "Reddit · r/java" par ex. (MainView appelle getPlatformInfo). */
     public String getPlatformInfo() {
-        String p = platform != null ? capitalize(platform) : "Social";
-        if (subreddit != null && !subreddit.isBlank()) {
-            return p + " · r/" + subreddit;
-        }
+        String p = getPlatformDisplayName();
+        if (subreddit != null && !subreddit.isBlank()) return p + " · r/" + subreddit;
         return p;
     }
 
-    /** "▲123 · 💬 45" (MainView appelle getEngagementText). */
-    public String getEngagementText() {
-        return "▲ " + score + " · 💬 " + numComments;
+    public String getEngagementText() { return "▲ " + getLikeCount() + " · 💬 " + numComments; }
+    public String getScoreText() { return "▲ " + getLikeCount(); }
+
+    public Instant getCreatedAt() {
+        return createdUtc > 0 ? Instant.ofEpochSecond(createdUtc) : null;
     }
 
-    /** "▲ 123" (MainView appelle getScoreText). */
-    public String getScoreText() {
-        return "▲ " + score;
-    }
-
-    /** Date formatée (MainView appelle getFormattedDate). */
     public String getFormattedDate() {
         Instant ts = getCreatedAt();
         if (ts == null) return "";
-        // Europe/Paris comme ton fuseau
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
                 .withZone(ZoneId.of("Europe/Paris"));
         return fmt.format(ts);
     }
 
-    /** Certains filtres utilisent getReplies() (FilterCommand). */
-    public int getReplies() {
-        return numComments;
+    // ======= Defaults par plateforme =======
+    private String defaultLogoForPlatform() {
+        if ("reddit".equalsIgnoreCase(platform)) return "/icons/reddit.svg";
+        if ("mastodon".equalsIgnoreCase(platform)) return "/icons/mastodon.svg";
+        return "/icons/link.svg";
     }
 
-    // --- Egalité sur l’id + plateforme (utile pour favoris, etc.) ---
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (!(o instanceof SocialMediaPost)) return false;
-        SocialMediaPost that = (SocialMediaPost) o;
-        return Objects.equals(id, that.id) &&
-               Objects.equals(platform, that.platform);
+    private String defaultBadgeColor() {
+        if ("reddit".equalsIgnoreCase(platform)) return "#FF4500";
+        if ("mastodon".equalsIgnoreCase(platform)) return "#6364FF";
+        return "#666666";
     }
 
-    @Override
-    public int hashCode() {
-        return Objects.hash(id, platform);
-    }
-
-    // --- Util ---
     private static String capitalize(String s) {
         if (s == null || s.isBlank()) return "";
         return s.substring(0,1).toUpperCase() + s.substring(1);
