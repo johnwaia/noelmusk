@@ -14,8 +14,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
+import java.util.Optional;
 
 @Service
 public class RedditService implements SocialMediaService {
@@ -31,7 +33,7 @@ public class RedditService implements SocialMediaService {
     private final String clientSecret;
     private final String userAgent;
 
-    // --- ctor Spring (3 args) ---
+    // --- Constructeur Spring (injection de propriétés/env vars) ---
     public RedditService(
             @Value("${reddit.client-id:${REDDIT_CLIENT_ID:}}") String clientId,
             @Value("${reddit.client-secret:${REDDIT_CLIENT_SECRET:}}") String clientSecret,
@@ -42,7 +44,7 @@ public class RedditService implements SocialMediaService {
         this.userAgent = safe(userAgent, "AntixBot/1.0 (+https://example.com)");
     }
 
-    // --- ctor sans argument (pour new RedditService() dans MainView/Factory) ---
+    // --- Constructeur sans argument (pour new RedditService()) ---
     public RedditService() {
         this.clientId = safe(System.getenv("REDDIT_CLIENT_ID"));
         this.clientSecret = safe(System.getenv("REDDIT_CLIENT_SECRET"));
@@ -50,110 +52,177 @@ public class RedditService implements SocialMediaService {
     }
 
     private static String safe(String s) { return s == null ? "" : s.trim(); }
-    private static String safe(String s, String def) { String v = safe(s); return v.isEmpty()?def:v; }
+    private static String safe(String s, String def) { String v = safe(s); return v.isEmpty() ? def : v; }
 
-    @Override public String getPlatformName() { return "reddit"; }
+    @Override
+    public String getPlatformName() {
+        return "reddit";
+    }
 
     @Override
     public List<SocialMediaPost> fetchPostsFromTag(String tag, int limit) {
         if (tag == null || tag.isBlank()) return List.of();
         int capped = Math.max(1, Math.min(limit <= 0 ? 20 : limit, 100));
 
-        // OAuth si credentials présents
+        // 1) OAuth si credentials présents
         if (!clientId.isBlank() && !clientSecret.isBlank()) {
             try {
-                var token = getAppOnlyToken().orElse(null);
-                if (token != null) {
-                    var posts = searchWithOAuth(tag, capped, token);
+                Optional<String> tokenOpt = getAppOnlyToken(); // scope=read
+                if (tokenOpt.isPresent()) {
+                    List<SocialMediaPost> posts = searchWithOAuth(tag, capped, tokenOpt.get());
                     if (!posts.isEmpty()) return posts;
                 }
             } catch (Exception e) {
-                System.err.println("[RedditService] OAuth failed, fallback to public: " + e.getMessage());
+                System.err.println("[RedditService] OAuth search failed, fallback to public JSON: " + e.getMessage());
             }
         }
 
-        // Repli JSON public
+        // 2) Fallback JSON public (peut être bloqué 403/429 en cloud)
         try {
             return searchPublicJson(tag, Math.min(capped, 50));
         } catch (Exception e) {
-            System.err.println("[RedditService] Public JSON failed: " + e.getMessage());
+            System.err.println("[RedditService] Public JSON search failed: " + e.getMessage());
             return List.of();
         }
     }
 
-    // ===== OAuth =====
+    // =================== OAuth ===================
+
     private Optional<String> getAppOnlyToken() throws IOException, InterruptedException {
-        String credentials = Base64.getEncoder().encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+        String credentials = Base64.getEncoder()
+                .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+
+        // Ajout de scope=read
+        String form = "grant_type=client_credentials&scope=read";
+
         HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
                 .header(HttpHeaders.AUTHORIZATION, "Basic " + credentials)
                 .header(HttpHeaders.USER_AGENT, userAgent)
                 .header(HttpHeaders.CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .POST(HttpRequest.BodyPublishers.ofString("grant_type=client_credentials"))
+                .POST(HttpRequest.BodyPublishers.ofString(form))
                 .build();
+
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() / 100 == 2) {
-            String token = mapper.readTree(resp.body()).path("access_token").asText(null);
+            JsonNode json = mapper.readTree(resp.body());
+            String token = json.path("access_token").asText(null);
             return Optional.ofNullable(token);
         }
         System.err.println("[RedditService] Token request failed: " + resp.statusCode() + " body=" + resp.body());
         return Optional.empty();
     }
 
-    private List<SocialMediaPost> searchWithOAuth(String query, int limit, String bearerToken) throws IOException, InterruptedException {
-        String url = OAUTH_SEARCH_URL + "?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
-                + "&limit=" + limit + "&sort=relevance&type=link&restrict_sr=false";
+    private List<SocialMediaPost> searchWithOAuth(String query, int limit, String bearerToken)
+            throws IOException, InterruptedException {
+
+        String url = OAUTH_SEARCH_URL
+                + "?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                + "&limit=" + limit
+                + "&sort=relevance"
+                + "&restrict_sr=false"
+                + "&raw_json=1"
+                + "&include_over_18=on"; // pas de type=link => plus de résultats
+
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + bearerToken)
                 .header(HttpHeaders.USER_AGENT, userAgent)
-                .GET().build();
+                .header(HttpHeaders.ACCEPT, "application/json")
+                .GET()
+                .build();
+
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() == 401 || resp.statusCode() == 403) throw new IllegalStateException("Unauthorized/Forbidden");
-        if (resp.statusCode() == 429) throw new IllegalStateException("Rate limited (429)");
-        if (resp.statusCode() / 100 != 2) throw new IllegalStateException("OAuth search failed: " + resp.statusCode());
-        return parse(resp.body());
+
+        if (resp.statusCode() == 401 || resp.statusCode() == 403) {
+            throw new IllegalStateException("Unauthorized/Forbidden: " + resp.statusCode());
+        }
+        if (resp.statusCode() == 429) {
+            throw new IllegalStateException("Rate limited (429) by Reddit API");
+        }
+        if (resp.statusCode() / 100 != 2) {
+            throw new IllegalStateException("Reddit OAuth search failed: " + resp.statusCode());
+        }
+
+        return parseListing(resp.body());
     }
 
-    // ===== Public JSON fallback =====
-    private List<SocialMediaPost> searchPublicJson(String query, int limit) throws IOException, InterruptedException {
-        String url = PUBLIC_SEARCH_URL + "?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
-                + "&limit=" + limit + "&sort=relevance&type=link&restrict_sr=false";
+    // ============ Fallback JSON public ============
+
+    private List<SocialMediaPost> searchPublicJson(String query, int limit)
+            throws IOException, InterruptedException {
+
+        String url = PUBLIC_SEARCH_URL
+                + "?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                + "&limit=" + limit
+                + "&sort=relevance"
+                + "&restrict_sr=false"
+                + "&raw_json=1"
+                + "&include_over_18=on";
+
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                .header(HttpHeaders.USER_AGENT, userAgent).GET().build();
+                .header(HttpHeaders.USER_AGENT, userAgent)
+                .header(HttpHeaders.ACCEPT, "application/json")
+                .GET()
+                .build();
+
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() == 429) throw new IllegalStateException("Rate limited (429)");
-        if (resp.statusCode() / 100 != 2) throw new IllegalStateException("Public search failed: " + resp.statusCode());
-        return parse(resp.body());
+
+        if (resp.statusCode() == 429) {
+            throw new IllegalStateException("Rate limited (429) by reddit.com public JSON");
+        }
+        if (resp.statusCode() / 100 != 2) {
+            throw new IllegalStateException("Public search failed: " + resp.statusCode());
+        }
+
+        return parseListing(resp.body());
     }
 
-    private List<SocialMediaPost> parse(String body) throws IOException {
-        var root = mapper.readTree(body);
-        var children = root.path("data").path("children");
+    // =================== Parsing commun ===================
+
+    private List<SocialMediaPost> parseListing(String body) throws IOException {
+        JsonNode root = mapper.readTree(body);
+        JsonNode children = root.path("data").path("children");
         List<SocialMediaPost> out = new ArrayList<>();
+
         if (children.isArray()) {
-            for (var c : children) {
-                var d = c.path("data");
-                var p = new SocialMediaPost();
+            for (JsonNode child : children) {
+                JsonNode d = child.path("data");
+                // ne garder que les posts (kind=t3 en général) — mais on reste permissif
+                String title = text(d, "title");
+                if (title == null || title.isBlank()) continue;
+
+                SocialMediaPost p = new SocialMediaPost();
                 p.setId(text(d, "id"));
                 p.setPlatform("reddit");
-                p.setTitle(text(d, "title"));
-                var author = text(d, "author");
-                p.setAuthor(author != null ? "u/" + author : null);
+                p.setTitle(title);
+
+                String author = text(d, "author");
+                p.setAuthor(author != null && !author.isBlank() ? "u/" + author : null);
+
                 p.setSubreddit(text(d, "subreddit"));
-                p.setPermalink("https://www.reddit.com" + text(d, "permalink"));
+
+                String permalink = text(d, "permalink");
+                if (permalink != null && !permalink.isBlank()) {
+                    p.setPermalink("https://www.reddit.com" + permalink);
+                }
                 p.setPostUrl(text(d, "url"));
-                p.setContent(opt(text(d, "selftext"), p.getTitle()));
+
+                String selftext = text(d, "selftext");
+                p.setContent((selftext != null && !selftext.isBlank()) ? selftext : title);
+
                 p.setScore(d.path("score").asInt(0));
                 p.setNumComments(d.path("num_comments").asInt(0));
                 p.setCreatedUtc(d.path("created_utc").asLong(0));
+
                 out.add(p);
             }
         }
         return out;
     }
 
-    private static String text(JsonNode n, String f) {
-        var v = n.path(f); if (v.isMissingNode() || v.isNull()) return null;
-        String t = v.asText(); return (t == null || "null".equals(t)) ? null : t;
-    }
-    private static String opt(String v, String def) { return (v == null || v.isBlank()) ? def : v; }
+    private static String text(JsonNode node, String field) {
+        JsonNode v = node.path(field);
+        if (v.isMissingNode() || v.isNull()) return null;
+        String t = v.asText();
+        return (t == null || "null".equals(t)) ? null : t;
+        }
 }
