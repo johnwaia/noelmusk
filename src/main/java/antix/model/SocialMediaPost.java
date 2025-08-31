@@ -1,116 +1,132 @@
 package antix.model;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonTypeInfo;
-import com.fasterxml.jackson.annotation.JsonSubTypes;
-import java.time.LocalDateTime;
-import java.util.List;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.Objects;
 
-@JsonIgnoreProperties(ignoreUnknown = true)
-@JsonTypeInfo(
-    use = JsonTypeInfo.Id.NAME,
-    include = JsonTypeInfo.As.PROPERTY,
-    property = "platform",
-    defaultImpl = MastodonPost.class
-)
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = MastodonPost.class, name = "mastodon"),
-    @JsonSubTypes.Type(value = RedditPost.class, name = "reddit")
-})
-public abstract class SocialMediaPost {
-    
-    @JsonProperty("id")
-    protected String id;
-    
-    @JsonProperty("content")
-    protected String content;
-    
-    @JsonProperty("created_at")
-    protected LocalDateTime createdAt;
-    
-    @JsonProperty("account")
-    protected Account account;
-    
-    @JsonProperty("language")
-    protected String language;
+/**
+ * Modèle simple pour afficher des posts (Reddit, Mastodon, etc.) dans Vaadin.
+ * Compatible avec le code existant (setters/getters utilisés dans tes services et commandes).
+ */
+public class SocialMediaPost {
 
-    // Constructeur par défaut
+    // --- Champs principaux ---
+    private String id;             // ex: t3_xxxxx (reddit) ou URL unique
+    private String platform;       // "reddit" | "mastodon" | ...
+    private String title;
+    private String author;         // ex: "u/foo" ou "@bar@instance"
+    private String subreddit;      // pour Reddit (peut rester vide)
+    private String permalink;      // lien interne (reddit: /r/.../comments/...)
+    private String postUrl;        // lien externe si présent
+    private String content;        // HTML (ton UI utilise innerHTML)
+    private int score;             // upvotes / favs
+    private int numComments;       // nb de réponses/commentaires
+    private long createdUtc;       // epoch seconds (utilisé pour le tri & affichage)
+
+    // --- Getters/Setters "bean" (Vaadin Grid les détecte) ---
     public SocialMediaPost() {}
 
-    // Méthodes abstraites que chaque plateforme doit implémenter
-    public abstract Integer getRepliesCount();
-    public abstract Integer getShareCount();
-    public abstract Integer getLikeCount();
-    public abstract String getPlatform();
-    public abstract List<Tag> getTags();
-    public abstract String getUrl(); 
-    public abstract String getAuthor();
-    public abstract String getDisplayName();
-    public abstract String getPlatformInfo();
-    public abstract String getEngagementText();
-    public abstract String getScoreText();
-    public abstract String getBadgeColor();
-    public abstract String getBadgeTextColor();
-    public abstract String getLogoPath();
-    public abstract String getPlatformShortCode();
-    public abstract String getPlatformDisplayName();
-    // Getters et setters pour les champs communs
-    public String getId() {
-        return id;
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public String getPlatform() { return platform; }
+    public void setPlatform(String platform) { this.platform = platform; }
+
+    public String getTitle() { return title; }
+    public void setTitle(String title) { this.title = title; }
+
+    public String getAuthor() { return author; }
+    public void setAuthor(String author) { this.author = author; }
+
+    public String getSubreddit() { return subreddit; }
+    public void setSubreddit(String subreddit) { this.subreddit = subreddit; }
+
+    public String getPermalink() { return permalink; }
+    public void setPermalink(String permalink) { this.permalink = permalink; }
+
+    public String getPostUrl() { return postUrl; }
+    public void setPostUrl(String postUrl) { this.postUrl = postUrl; }
+
+    public String getContent() { return content; }
+    public void setContent(String content) { this.content = content; }
+
+    public int getScore() { return score; }
+    public void setScore(int score) { this.score = score; }
+
+    public int getNumComments() { return numComments; }
+    public void setNumComments(int numComments) { this.numComments = numComments; }
+
+    public long getCreatedUtc() { return createdUtc; }
+    public void setCreatedUtc(long createdUtc) { this.createdUtc = createdUtc; }
+
+    // --- Méthodes utilitaires attendues par ton UI/commandes ---
+
+    /** Date sous forme Instant (utilisé pour le tri dans MainView). */
+    public Instant getCreatedAt() {
+        return createdUtc > 0 ? Instant.ofEpochSecond(createdUtc) : null;
     }
 
-    public void setId(String id) {
-        this.id = id;
+    /** Affichage "sympa" pour l’UI (MainView appelle getDisplayName). */
+    public String getDisplayName() {
+        if (author != null && subreddit != null && !subreddit.isBlank()) {
+            return author + " in r/" + subreddit;
+        }
+        return author != null ? author : (title != null ? title : "Post");
     }
 
-    public String getContent() {
-        return content;
+    /** "Reddit · r/java" par ex. (MainView appelle getPlatformInfo). */
+    public String getPlatformInfo() {
+        String p = platform != null ? capitalize(platform) : "Social";
+        if (subreddit != null && !subreddit.isBlank()) {
+            return p + " · r/" + subreddit;
+        }
+        return p;
     }
 
-    public void setContent(String content) {
-        this.content = content;
+    /** "▲123 · 💬 45" (MainView appelle getEngagementText). */
+    public String getEngagementText() {
+        return "▲ " + score + " · 💬 " + numComments;
     }
 
-    public LocalDateTime getCreatedAt() {
-        return createdAt;
+    /** "▲ 123" (MainView appelle getScoreText). */
+    public String getScoreText() {
+        return "▲ " + score;
     }
 
-    public void setCreatedAt(LocalDateTime createdAt) {
-        this.createdAt = createdAt;
+    /** Date formatée (MainView appelle getFormattedDate). */
+    public String getFormattedDate() {
+        Instant ts = getCreatedAt();
+        if (ts == null) return "";
+        // Europe/Paris comme ton fuseau
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+                .withZone(ZoneId.of("Europe/Paris"));
+        return fmt.format(ts);
     }
 
-    public Account getAccount() {
-        return account;
+    /** Certains filtres utilisent getReplies() (FilterCommand). */
+    public int getReplies() {
+        return numComments;
     }
 
-    public void setAccount(Account account) {
-        this.account = account;
-    }
-
-    public String getLanguage() {
-        return language;
-    }
-
-    public void setLanguage(String language) {
-        this.language = language;
+    // --- Egalité sur l’id + plateforme (utile pour favoris, etc.) ---
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof SocialMediaPost)) return false;
+        SocialMediaPost that = (SocialMediaPost) o;
+        return Objects.equals(id, that.id) &&
+               Objects.equals(platform, that.platform);
     }
 
     @Override
-    public String toString() {
-        return String.format("%s[id=%s, platform=%s]", 
-                           getClass().getSimpleName(), id, getPlatform());
+    public int hashCode() {
+        return Objects.hash(id, platform);
     }
-    public String getFormattedDate() {
-    if (getCreatedAt() == null) return "Date inconnue";
-    
-    try {
-        java.time.format.DateTimeFormatter formatter = 
-            java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy à HH:mm");
-        
-        return getCreatedAt().format(formatter);
-    } catch (Exception e) {
-        return "Date invalide";
+
+    // --- Util ---
+    private static String capitalize(String s) {
+        if (s == null || s.isBlank()) return "";
+        return s.substring(0,1).toUpperCase() + s.substring(1);
     }
-}
 }
