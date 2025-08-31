@@ -31,24 +31,35 @@ public class RedditService implements SocialMediaService {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private final String clientId;
-    private final String clientSecret; // peut être vide (installed app)
+    private final String clientSecret; // vide pour "installed app"
     private final String userAgent;
+
+    // pour le grant "password" (apps script)
+    private final String username;
+    private final String password;
 
     // ---- ctor Spring
     public RedditService(
             @Value("${reddit.client-id:${REDDIT_CLIENT_ID:}}") String clientId,
             @Value("${reddit.client-secret:${REDDIT_CLIENT_SECRET:}}") String clientSecret,
-            @Value("${reddit.user-agent:${REDDIT_USER_AGENT:AntixBot/1.0 (+https://example.com)}}") String userAgent
+            @Value("${reddit.user-agent:${REDDIT_USER_AGENT:AntixBot/1.0 (+https://example.com)}}") String userAgent,
+            @Value("${reddit.username:${REDDIT_USERNAME:}}") String username,
+            @Value("${reddit.password:${REDDIT_PASSWORD:}}") String password
     ) {
         this.clientId = nz(clientId);
         this.clientSecret = nz(clientSecret);
         this.userAgent = nz(userAgent, "AntixBot/1.0 (+https://example.com)");
+        this.username = nz(username);
+        this.password = nz(password);
     }
-    // ---- ctor no-arg (si tu fais new RedditService() quelque part)
+
+    // ---- ctor no-arg (si tu instancies à la main)
     public RedditService() {
         this.clientId = nz(System.getenv("REDDIT_CLIENT_ID"));
         this.clientSecret = nz(System.getenv("REDDIT_CLIENT_SECRET"));
         this.userAgent = nz(System.getenv("REDDIT_USER_AGENT"), "AntixBot/1.0 (+https://example.com)");
+        this.username = nz(System.getenv("REDDIT_USERNAME"));
+        this.password = nz(System.getenv("REDDIT_PASSWORD"));
     }
 
     private static String nz(String s) { return s == null ? "" : s.trim(); }
@@ -64,40 +75,63 @@ public class RedditService implements SocialMediaService {
 
         System.out.println("[RedditService] cfg: clientId=" + mask(clientId)
                 + ", secret=" + (clientSecret.isBlank() ? "(vide)" : "(présent)")
-                + ", UA=" + userAgent);
+                + ", UA=" + userAgent
+                + ", user=" + (username.isBlank() ? "(vide)" : mask(username)));
 
-        // 1) OAuth si on a un clientId
-        if (!clientId.isBlank()) {
+        // 1) OAuth: client_credentials si secret présent
+        Optional<String> token = Optional.empty();
+        if (!clientId.isBlank() && !clientSecret.isBlank()) {
             try {
-                Optional<String> tokenOpt = getTokenSmart();
-                if (tokenOpt.isPresent()) {
-                    String token = tokenOpt.get();
-                    System.out.println("[RedditService] ✅ OAuth OK, token reçu. Recherche via oauth.reddit.com …");
+                token = getTokenClientCredentials();
+            } catch (Exception e) {
+                System.err.println("[RedditService] client_credentials exception: " + e.getMessage());
+            }
+        }
 
-                    // Essai A: recherche globale
-                    var posts = searchOAuth(OAUTH_SEARCH_URL, tag, capped, token, "global");
-                    if (!posts.isEmpty()) return posts;
+        // 2) Fallback installed_client (sans secret)
+        if (token.isEmpty() && !clientId.isBlank()) {
+            try {
+                System.err.println("[RedditService] client_credentials rejeté -> essai installed_client …");
+                token = getTokenInstalledClient();
+            } catch (Exception e) {
+                System.err.println("[RedditService] installed_client exception: " + e.getMessage());
+            }
+        }
 
-                    // Essai B: /r/all/search
-                    posts = searchOAuth(OAUTH_ALL_SEARCH_URL, tag, capped, token, "r/all");
-                    if (!posts.isEmpty()) return posts;
+        // 3) Fallback password (script) si user/pass fournis
+        if (token.isEmpty() && !clientId.isBlank() && !clientSecret.isBlank()
+                && !username.isBlank() && !password.isBlank()) {
+            try {
+                System.err.println("[RedditService] installed_client rejeté -> essai password grant …");
+                token = getTokenPassword();
+            } catch (Exception e) {
+                System.err.println("[RedditService] password grant exception: " + e.getMessage());
+            }
+        }
 
-                    // Essai C: tri par nouveauté (parfois renvoie plus)
-                    posts = searchOAuth(OAUTH_SEARCH_URL, tag, capped, token, "global-new", "new");
-                    if (!posts.isEmpty()) return posts;
+        if (token.isPresent()) {
+            try {
+                String t = token.get();
+                System.out.println("[RedditService] ✅ OAuth OK, recherche via oauth.reddit.com …");
 
-                    System.out.println("[RedditService] OAuth a renvoyé 0 résultat pour le tag '" + tag + "'.");
-                } else {
-                    System.out.println("[RedditService] ⚠️ Aucun token OAuth obtenu (type d'app Reddit/credentials).");
-                }
+                var posts = searchOAuth(OAUTH_SEARCH_URL, tag, capped, t, "global");
+                if (!posts.isEmpty()) return posts;
+
+                posts = searchOAuth(OAUTH_ALL_SEARCH_URL, tag, capped, t, "r/all");
+                if (!posts.isEmpty()) return posts;
+
+                posts = searchOAuth(OAUTH_SEARCH_URL, tag, capped, t, "global-new", "new");
+                if (!posts.isEmpty()) return posts;
+
+                System.out.println("[RedditService] OAuth a renvoyé 0 résultat.");
             } catch (Exception e) {
                 System.err.println("[RedditService] ❌ OAuth search failed: " + e.getMessage());
             }
         } else {
-            System.out.println("[RedditService] ⚠️ Pas de CLIENT_ID → on saute OAuth.");
+            System.err.println("[RedditService] ⚠️ Aucun token OAuth obtenu (type d'app / credentials ?).");
         }
 
-        // 2) Fallback public (souvent 403/429 en cloud)
+        // 4) Fallback public JSON (souvent 403 sur hébergeurs cloud)
         try {
             System.out.println("[RedditService] ↘️ Fallback public JSON …");
             return searchPublicJson(tag, Math.min(capped, 50));
@@ -107,23 +141,12 @@ public class RedditService implements SocialMediaService {
         }
     }
 
-    // ===== TOKENS =====
-    private Optional<String> getTokenSmart() throws IOException, InterruptedException {
-        if (!clientSecret.isBlank()) {
-            System.out.println("[RedditService] OAuth mode = client_credentials (secret présent)");
-            var t = getTokenClientCredentials();
-            if (t.isPresent()) return t;
-            System.err.println("[RedditService] client_credentials rejeté -> essai fallback installed_client …");
-        } else {
-            System.out.println("[RedditService] OAuth mode = installed_client (secret vide)");
-        }
-        // Fallback installed_client (ne requiert PAS de secret)
-        return getTokenInstalledClient();
-    }
-
+    // ======== TOKENS ========
 
     private Optional<String> getTokenClientCredentials() throws IOException, InterruptedException {
-        String credentials = Base64.getEncoder().encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+        System.out.println("[RedditService] OAuth mode = client_credentials (secret présent)");
+        String credentials = Base64.getEncoder()
+                .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
         String form = "grant_type=client_credentials&scope=read";
         HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
                 .header(HttpHeaders.AUTHORIZATION, "Basic " + credentials)
@@ -142,7 +165,9 @@ public class RedditService implements SocialMediaService {
     }
 
     private Optional<String> getTokenInstalledClient() throws IOException, InterruptedException {
-        String credentials = Base64.getEncoder().encodeToString((clientId + ":").getBytes(StandardCharsets.UTF_8)); // secret vide
+        System.out.println("[RedditService] OAuth mode = installed_client");
+        String credentials = Base64.getEncoder()
+                .encodeToString((clientId + ":").getBytes(StandardCharsets.UTF_8)); // secret vide
         String form = "grant_type=" + enc("https://oauth.reddit.com/grants/installed_client")
                 + "&device_id=DO_NOT_TRACK_THIS_DEVICE&scope=read";
         HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
@@ -161,7 +186,35 @@ public class RedditService implements SocialMediaService {
         return Optional.empty();
     }
 
-    // ===== SEARCH (OAuth) =====
+    // Nouveau : grant "password" (script)
+    private Optional<String> getTokenPassword() throws IOException, InterruptedException {
+        System.out.println("[RedditService] OAuth mode = password (script)");
+        String credentials = Base64.getEncoder()
+                .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+        String form = "grant_type=password"
+                + "&username=" + enc(username)
+                + "&password=" + enc(password)
+                + "&scope=read";
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
+                .header(HttpHeaders.AUTHORIZATION, "Basic " + credentials)
+                .header(HttpHeaders.USER_AGENT, userAgent)
+                .header(HttpHeaders.CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(form))
+                .build();
+
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        System.out.println("[RedditService] token(password) status=" + resp.statusCode());
+        if (resp.statusCode() / 100 == 2) {
+            String token = mapper.readTree(resp.body()).path("access_token").asText(null);
+            return Optional.ofNullable(token);
+        }
+        System.err.println("[RedditService] token password failed: " + resp.statusCode() + " body=" + resp.body());
+        return Optional.empty();
+    }
+
+    // ======== SEARCH (OAuth) ========
+
     private List<SocialMediaPost> searchOAuth(String baseUrl, String query, int limit, String bearerToken, String label) throws IOException, InterruptedException {
         return searchOAuth(baseUrl, query, limit, bearerToken, label, "relevance");
     }
@@ -184,14 +237,6 @@ public class RedditService implements SocialMediaService {
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         System.out.println("[RedditService] search(" + label + ") status=" + resp.statusCode());
 
-        if (resp.statusCode() == 401 || resp.statusCode() == 403) {
-            System.err.println("[RedditService] search(" + label + ") unauthorized/forbidden, body=" + resp.body());
-            return List.of();
-        }
-        if (resp.statusCode() == 429) {
-            System.err.println("[RedditService] search(" + label + ") rate limited (429)");
-            return List.of();
-        }
         if (resp.statusCode() / 100 != 2) {
             System.err.println("[RedditService] search(" + label + ") failed: " + resp.statusCode() + " body=" + resp.body());
             return List.of();
@@ -199,7 +244,7 @@ public class RedditService implements SocialMediaService {
         return parseListing(resp.body());
     }
 
-    // ===== Fallback PUBLIC =====
+    // ======== Fallback PUBLIC ========
     private List<SocialMediaPost> searchPublicJson(String query, int limit) throws IOException, InterruptedException {
         String url = PUBLIC_SEARCH_URL
                 + "?q=" + enc(query)
@@ -220,7 +265,7 @@ public class RedditService implements SocialMediaService {
         return parseListing(resp.body());
     }
 
-    // ===== PARSING =====
+    // ======== PARSING ========
     private List<SocialMediaPost> parseListing(String body) throws IOException {
         JsonNode root = mapper.readTree(body);
         JsonNode children = root.path("data").path("children");
