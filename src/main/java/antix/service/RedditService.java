@@ -111,12 +111,16 @@ public class RedditService implements SocialMediaService {
     private Optional<String> getTokenSmart() throws IOException, InterruptedException {
         if (!clientSecret.isBlank()) {
             System.out.println("[RedditService] OAuth mode = client_credentials (secret présent)");
-            return getTokenClientCredentials();
+            var t = getTokenClientCredentials();
+            if (t.isPresent()) return t;
+            System.err.println("[RedditService] client_credentials rejeté -> essai fallback installed_client …");
         } else {
             System.out.println("[RedditService] OAuth mode = installed_client (secret vide)");
-            return getTokenInstalledClient();
         }
+        // Fallback installed_client (ne requiert PAS de secret)
+        return getTokenInstalledClient();
     }
+
 
     private Optional<String> getTokenClientCredentials() throws IOException, InterruptedException {
         String credentials = Base64.getEncoder().encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
