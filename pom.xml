@@ -3,26 +3,28 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <groupId>com</groupId>
-    <artifactId>antix</artifactId>
-    <name>antix</name>
-    <version>2025</version>
-    <packaging>jar</packaging>
-
-    <properties>
-        <java.version>21</java.version>
-        <vaadin.version>24.7.6</vaadin.version>
-        <!-- ✅ Force la version Jackson compatible -->
-        <jackson.version>2.17.2</jackson.version>
-        <key.store.password>${env.KEY_STORE_PASSWORD}</key.store.password>
-    </properties>
 
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
         <version>3.3.6</version>
+        <relativePath/> <!-- lookup parent from repository -->
     </parent>
 
+    <groupId>com</groupId>
+    <artifactId>antix</artifactId>
+    <version>2025</version>
+    <name>antix</name>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>21</java.version>
+        <vaadin.version>24.7.6</vaadin.version>
+        <jackson.version>2.17.2</jackson.version>
+        <key.store.password>${env.KEY_STORE_PASSWORD}</key.store.password>
+    </properties>
+
+    <!-- ✅ Repository Vaadin -->
     <repositories>
         <repository>
             <id>Vaadin Directory</id>
@@ -33,6 +35,7 @@
         </repository>
     </repositories>
 
+    <!-- ✅ Gestion des versions communes -->
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -42,7 +45,7 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
-            <!-- ✅ Force TOUTES les versions Jackson -->
+            <!-- ✅ Force versions Jackson -->
             <dependency>
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-core</artifactId>
@@ -67,43 +70,47 @@
     </dependencyManagement>
 
     <dependencies>
+        <!-- ✅ Supprime la version explicite (Spring Boot gère H2) -->
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
-            <version>2.3.232</version>
             <scope>runtime</scope>
         </dependency>
+
         <dependency>
             <groupId>org.jsoup</groupId>
             <artifactId>jsoup</artifactId>
             <version>1.15.4</version>
         </dependency>
+
         <dependency>
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
             <version>4.5.14</version>
         </dependency>
+
         <dependency>
             <groupId>jakarta.json.bind</groupId>
             <artifactId>jakarta.json.bind-api</artifactId>
-            <version>3.0.1</version>
         </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
-            <version>1.18.36</version>
             <scope>provided</scope>
         </dependency>
-        <!-- ✅ SUPPRIME la version explicite, utilise celle du dependencyManagement -->
+
+        <!-- ✅ Jackson (utilise dependencyManagement) -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
-        <!-- ✅ Ajoute le module JSR310 pour les dates -->
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
         </dependency>
+
+        <!-- ✅ Vaadin -->
         <dependency>
             <groupId>com.vaadin</groupId>
             <artifactId>vaadin-core</artifactId>
@@ -117,6 +124,8 @@
             <artifactId>line-awesome</artifactId>
             <version>2.1.0</version>
         </dependency>
+
+        <!-- ✅ Spring Boot Starters -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
@@ -143,13 +152,15 @@
     </dependencies>
 
     <build>
-    <defaultGoal>package</defaultGoal>
-
+        <defaultGoal>package</defaultGoal>
         <plugins>
+            <!-- ✅ Plugin Spring Boot -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+
+            <!-- ✅ Spotless pour formatage -->
             <plugin>
                 <groupId>com.diffplug.spotless</groupId>
                 <artifactId>spotless-maven-plugin</artifactId>
@@ -163,6 +174,8 @@
                     </java>
                 </configuration>
             </plugin>
+
+            <!-- ✅ Vaadin Plugin -->
             <plugin>
                 <groupId>com.vaadin</groupId>
                 <artifactId>vaadin-maven-plugin</artifactId>
@@ -178,6 +191,7 @@
         </plugins>
     </build>
 
+    <!-- ✅ Profiles -->
     <profiles>
         <profile>
             <id>dev</id>
@@ -185,14 +199,6 @@
                 <vaadin.production.mode>false</vaadin.production.mode>
                 <vaadin.frontend.hotdeploy>true</vaadin.frontend.hotdeploy>
             </properties>
-            <build>
-                <resources>
-                    <resource>
-                        <directory>src/main/resources</directory>
-                        <filtering>true</filtering>
-                    </resource>
-                </resources>
-            </build>
         </profile>
         <profile>
             <id>production</id>
@@ -213,12 +219,6 @@
                 </dependency>
             </dependencies>
             <build>
-                <resources>
-                    <resource>
-                        <directory>src/main/resources</directory>
-                        <filtering>true</filtering>
-                    </resource>
-                </resources>
                 <plugins>
                     <plugin>
                         <groupId>com.vaadin</groupId>
