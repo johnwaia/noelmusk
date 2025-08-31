@@ -4,8 +4,8 @@ services:
     env: docker
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    plan: free         # ou starter
-    region: frankfurt  # à adapter
+    plan: free
+    region: frankfurt
     envVars:
       - key: SPRING_PROFILES_ACTIVE
         value: prod
@@ -15,8 +15,7 @@ services:
         value: "mastodon.social"
       - key: MASTODON_USER_AGENT
         value: "AntixBot/1.0 (+https://noelmusk.onrender.com)"
-
-      # ↓↓↓ ne mets PAS les vraies valeurs dans le repo si c’est public
-      # Laisse sans value: Render te les demandera au premier déploiement Blueprint
       - key: REDDIT_CLIENT_ID
-      - key: REDDIT_CLIENT_SECRET   # supprime cette ligne si ton app Reddit est “installed”
+        fromSecret: reddit_client_id
+      - key: REDDIT_CLIENT_SECRET
+        fromSecret: reddit_client_secret
