@@ -1,32 +1,22 @@
 package antix.model;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.Data;
+import java.util.Objects;
 
-@Data
-@JsonIgnoreProperties(ignoreUnknown = true)
 public class Tag {
-    @JsonProperty("name")
     private String name;
-    
-    @JsonProperty("url")
-    private String url;
-    
-    // Constructeurs
+
     public Tag() {}
-    
-    public Tag(String name) {
-        this.name = name;
+    public Tag(String name) { this.name = name; }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Tag)) return false;
+        Tag tag = (Tag) o;
+        return Objects.equals(name, tag.name);
     }
-    
-    public Tag(String name, String url) {
-        this.name = name;
-        this.url = url;
-    }
-    
-    @Override
-    public String toString() {
-        return name;
-    }
+    @Override public int hashCode() { return Objects.hash(name); }
+    @Override public String toString() { return name; }
 }
