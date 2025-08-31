@@ -14,3 +14,7 @@ vaadin:
   launch-browser: false
   frontend:
     hotdeploy: false
+reddit:
+  client-id: ${REDDIT_CLIENT_ID}
+  client-secret: ${REDDIT_CLIENT_SECRET}
+  user-agent: ${REDDIT_USER_AGENT:AntixBot/1.0 (+https://example.com)}

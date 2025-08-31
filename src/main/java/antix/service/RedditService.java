@@ -1,173 +1,226 @@
 package antix.service;
 
-import antix.model.RedditPost;
-import antix.model.SocialMediaPost;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.util.UriComponentsBuilder;
+import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
-import java.util.logging.Logger;
-import java.util.logging.Level;
+import java.util.Optional;
 
+/**
+ * Reddit search via official OAuth API with a resilient fallback to public JSON.
+ * Requires env/properties:
+ *   reddit.client-id
+ *   reddit.client-secret
+ *   reddit.user-agent
+ */
 @Service
 public class RedditService implements SocialMediaService {
-    
-    private static final Logger logger = Logger.getLogger(RedditService.class.getName());
-    private static final String REDDIT_BASE_URL = "https://www.reddit.com";
-    private static final String USER_AGENT = "Antix/1.0 by /u/youruser";
-    
-    private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
-    
+
+    private static final String OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
+    private static final String OAUTH_SEARCH_URL = "https://oauth.reddit.com/search";
+    private static final String PUBLIC_SEARCH_URL = "https://www.reddit.com/search.json";
+
+    private final HttpClient http;
+    private final ObjectMapper mapper;
+
+    private final String clientId;
+    private final String clientSecret;
+    private final String userAgent;
+
+    public RedditService(
+            @Value("${reddit.client-id:${REDDIT_CLIENT_ID:}}") String clientId,
+            @Value("${reddit.client-secret:${REDDIT_CLIENT_SECRET:}}") String clientSecret,
+            @Value("${reddit.user-agent:${REDDIT_USER_AGENT:AntixBot/1.0 (+https://example.com)}}") String userAgent
+    ) {
+        this.http = HttpClient.newHttpClient();
+        this.mapper = new ObjectMapper();
+        this.clientId = clientId == null ? "" : clientId.trim();
+        this.clientSecret = clientSecret == null ? "" : clientSecret.trim();
+        this.userAgent = userAgent == null ? "AntixBot/1.0 (+https://example.com)" : userAgent.trim();
+    }
+
+    // ---- Public API ---------------------------------------------------------
+
     @Override
-    public List<SocialMediaPost> fetchPostsFromTag(String tag, int limit) {
-        System.out.println("🔍 [REDDIT] Recherche pour le tag: '" + tag + "', limite: " + limit);
-        
+    public List<SocialMediaPost> search(String query) {
+        return search(query, 20);
+    }
+
+    public List<SocialMediaPost> search(String query, int limit) {
+        if (query == null || query.isBlank()) return List.of();
+
+        // 1) Essayer OAuth (fiable en prod)
+        if (hasCredentials()) {
+            try {
+                String token = getAppOnlyToken()
+                        .orElseThrow(() -> new IllegalStateException("Reddit OAuth: token absent"));
+                List<SocialMediaPost> posts = searchWithOAuth(query, limit, token);
+                if (!posts.isEmpty()) return posts;
+            } catch (Exception e) {
+                // journaliser et tomber en repli
+                System.err.println("[RedditService] OAuth search failed, falling back to public API: " + e.getMessage());
+            }
+        }
+
+        // 2) Fallback API publique JSON (peut renvoyer 429 en cloud)
         try {
-            // ✅ AMÉLIORATION 1: Essayer plusieurs stratégies de recherche
-            List<SocialMediaPost> allPosts = new ArrayList<>();
-            
-            // Stratégie 1: Recherche dans un subreddit dédié (si c'est un subreddit)
-            allPosts.addAll(searchInSubreddit(tag, limit / 2));
-            
-            // Stratégie 2: Recherche globale
-            allPosts.addAll(searchGlobally(tag, limit / 2));
-            
-            System.out.println("✅ [REDDIT] Total posts trouvés: " + allPosts.size());
-            return allPosts.subList(0, Math.min(allPosts.size(), limit));
-            
+            return searchPublicJson(query, limit);
         } catch (Exception e) {
-            System.out.println("❌ [REDDIT] ERREUR GLOBALE: " + e.getMessage());
-            logger.log(Level.SEVERE, "Erreur Reddit API: " + e.getMessage(), e);
-            return new ArrayList<>();
+            System.err.println("[RedditService] Public JSON search failed: " + e.getMessage());
+            return List.of();
         }
     }
-    
-    // ✅ NOUVELLE MÉTHODE: Recherche dans un subreddit
-    private List<SocialMediaPost> searchInSubreddit(String tag, int limit) {
-        try {
-            String subredditUrl = UriComponentsBuilder
-                .fromHttpUrl(REDDIT_BASE_URL + "/r/" + tag + "/new.json")
-                .queryParam("limit", Math.min(limit, 25))
-                .build()
-                .toUriString();
-                
-            System.out.println("🎯 [REDDIT] Test subreddit URL: " + subredditUrl);
-            return makeRequest(subredditUrl);
-            
-        } catch (Exception e) {
-            System.out.println("⚠️ [REDDIT] Subreddit '" + tag + "' non trouvé ou erreur: " + e.getMessage());
-            return new ArrayList<>();
+
+    // ---- OAuth flow ---------------------------------------------------------
+
+    private boolean hasCredentials() {
+        return !clientId.isBlank() && !clientSecret.isBlank();
+    }
+
+    private Optional<String> getAppOnlyToken() throws IOException, InterruptedException {
+        String credentials = Base64.getEncoder()
+                .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+
+        String form = "grant_type=client_credentials"; // app-only
+        HttpRequest req = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
+                .header(HttpHeaders.AUTHORIZATION, "Basic " + credentials)
+                .header(HttpHeaders.USER_AGENT, userAgent)
+                .header(HttpHeaders.CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(form))
+                .build();
+
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+            JsonNode json = mapper.readTree(resp.body());
+            String token = json.path("access_token").asText(null);
+            return Optional.ofNullable(token);
+        } else {
+            System.err.println("[RedditService] Token request failed: " + resp.statusCode() + " body=" + resp.body());
+            return Optional.empty();
         }
     }
-    
-    // ✅ NOUVELLE MÉTHODE: Recherche globale améliorée
-    private List<SocialMediaPost> searchGlobally(String tag, int limit) {
-        try {
-            String searchUrl = UriComponentsBuilder
-                .fromHttpUrl(REDDIT_BASE_URL + "/search.json")
-                .queryParam("q", "title:" + tag + " OR selftext:" + tag)  // ✅ Recherche plus précise
-                .queryParam("sort", "new")
-                .queryParam("type", "link")                                // ✅ Seulement les posts
-                .queryParam("limit", Math.min(limit, 25))
-                .build()
-                .toUriString();
-                
-            System.out.println("🌐 [REDDIT] Recherche globale URL: " + searchUrl);
-            return makeRequest(searchUrl);
-            
-        } catch (Exception e) {
-            System.out.println("❌ [REDDIT] Erreur recherche globale: " + e.getMessage());
-            return new ArrayList<>();
+
+    private List<SocialMediaPost> searchWithOAuth(String query, int limit, String bearerToken) throws IOException, InterruptedException {
+        String url = OAUTH_SEARCH_URL
+                + "?q=" + url(query)
+                + "&limit=" + Math.max(1, Math.min(limit, 100))
+                + "&sort=relevance&type=link&restrict_sr=false";
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + bearerToken)
+                .header(HttpHeaders.USER_AGENT, userAgent)
+                .GET()
+                .build();
+
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+        if (resp.statusCode() == 401 || resp.statusCode() == 403) {
+            throw new IllegalStateException("Unauthorized/Forbidden: check Reddit credentials & scopes");
         }
+        if (resp.statusCode() == 429) {
+            throw new IllegalStateException("Rate limited (429) by Reddit API");
+        }
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IllegalStateException("Reddit OAuth search failed: " + resp.statusCode());
+        }
+
+        return parseRedditListing(resp.body());
     }
-    
-    // ✅ MÉTHODE COMMUNE pour les requêtes
-    private List<SocialMediaPost> makeRequest(String url) throws Exception {
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("User-Agent", USER_AGENT);
-        HttpEntity<String> entity = new HttpEntity<>(headers);
-        
-        ResponseEntity<String> response = restTemplate.exchange(
-            url, HttpMethod.GET, entity, String.class
-        );
-        
-        System.out.println("📡 [REDDIT] Status: " + response.getStatusCode());
-        
-        List<SocialMediaPost> posts = parseResponse(response.getBody());
-        System.out.println("📄 [REDDIT] Posts parsés: " + posts.size());
-        
-        return posts;
+
+    // ---- Public JSON fallback ----------------------------------------------
+
+    private List<SocialMediaPost> searchPublicJson(String query, int limit) throws IOException, InterruptedException {
+        String url = PUBLIC_SEARCH_URL
+                + "?q=" + url(query)
+                + "&limit=" + Math.max(1, Math.min(limit, 50))
+                + "&sort=relevance&type=link&restrict_sr=false";
+
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .header(HttpHeaders.USER_AGENT, userAgent)
+                .GET()
+                .build();
+
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+        if (resp.statusCode() == 429) {
+            throw new IllegalStateException("Rate limited (429) by reddit.com public JSON");
+        }
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IllegalStateException("Public JSON search failed: " + resp.statusCode());
+        }
+
+        return parseRedditListing(resp.body());
     }
-    
-    @Override
-    public String getPlatformName() {
-        return "reddit";
-    }
-    
-    private List<SocialMediaPost> parseResponse(String jsonBody) {
-        List<SocialMediaPost> posts = new ArrayList<>();
-        
-        try {
-            JsonNode root = objectMapper.readTree(jsonBody);
-            JsonNode children = root.path("data").path("children");
-            
-            System.out.println("🔍 [REDDIT] Enfants trouvés dans JSON: " + children.size());
-            
+
+    // ---- Parsing ------------------------------------------------------------
+
+    private List<SocialMediaPost> parseRedditListing(String body) throws IOException {
+        JsonNode root = mapper.readTree(body);
+        JsonNode children = root.path("data").path("children");
+        List<SocialMediaPost> out = new ArrayList<>();
+
+        if (children.isArray()) {
             for (JsonNode child : children) {
-                JsonNode data = child.path("data");
-                RedditPost post = createPost(data);
-                if (post != null) {
-                    posts.add(post);
-                    System.out.println("✅ [REDDIT] Post créé: " + post.getTitle().substring(0, Math.min(50, post.getTitle().length())));
-                }
+                JsonNode d = child.path("data");
+                String title = text(d, "title");
+                String selftext = text(d, "selftext");
+                String author = text(d, "author");
+                String subreddit = text(d, "subreddit");
+                String permalink = "https://www.reddit.com" + text(d, "permalink");
+                String url = text(d, "url");
+                long createdUtc = d.path("created_utc").asLong(0);
+                int score = d.path("score").asInt(0);
+                int comments = d.path("num_comments").asInt(0);
+                String thumb = text(d, "thumbnail");
+
+                // TODO: adapte ce mapping selon ta classe SocialMediaPost
+                SocialMediaPost post = SocialMediaPost.builder()
+                        .platform("reddit")
+                        .author(author)
+                        .title(title)
+                        .content(selftext != null && !selftext.isBlank() ? selftext : title)
+                        .link(permalink)
+                        .mediaUrl(isHttpUrl(thumb) ? thumb : null)
+                        .externalUrl(url)
+                        .score(score)
+                        .commentsCount(comments)
+                        .subgroup(subreddit)                 // ex: r/java
+                        .publishedAt(createdUtc > 0 ? Instant.ofEpochSecond(createdUtc) : null)
+                        .build();
+
+                out.add(post);
             }
-            
-        } catch (Exception e) {
-            System.out.println("❌ [REDDIT] Erreur parsing JSON: " + e.getMessage());
-            logger.log(Level.WARNING, "Erreur parsing: " + e.getMessage(), e);
         }
-        
-        return posts;
+        return out;
     }
-    
-    private RedditPost createPost(JsonNode data) {
-        try {
-            RedditPost post = new RedditPost();
-            
-            post.setId(data.path("id").asText());
-            post.setTitle(data.path("title").asText());
-            post.setAuthor(data.path("author").asText());
-            post.setSubreddit(data.path("subreddit").asText());
-            post.setScore(data.path("score").asInt());
-            post.setNumComments(data.path("num_comments").asInt());
-            post.setPermalink(data.path("permalink").asText());
-            post.setPostUrl(data.path("url").asText());
-            long createdUtc = data.path("created_utc").asLong();
-            post.setCreatedUtc(createdUtc);
-            
-            // Contenu = titre + description
-            String content = data.path("title").asText();
-            String selftext = data.path("selftext").asText();
-            if (!selftext.isEmpty()) {
-                content += "\n\n" + selftext;
-            }
-            post.setContent(content);
-            
-            return post;
-            
-        } catch (Exception e) {
-            System.out.println("❌ [REDDIT] Erreur création post: " + e.getMessage());
-            logger.log(Level.WARNING, "Erreur création post: " + e.getMessage());
-            return null;
-        }
+
+    // ---- Utils --------------------------------------------------------------
+
+    private static String url(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    private static String text(JsonNode node, String field) {
+        JsonNode v = node.path(field);
+        if (v.isMissingNode() || v.isNull()) return null;
+        String t = v.asText();
+        return (t == null || t.equals("null")) ? null : t;
+    }
+
+    private static boolean isHttpUrl(String s) {
+        return s != null && (s.startsWith("http://") || s.startsWith("https://"));
     }
 }
