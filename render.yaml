@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: antix-app
+    env: java
+    plan: free
+    buildCommand: "./mvnw clean package -DskipTests"
+    startCommand: "java -jar target/antix-2025.jar"
+    envVars:
+      - key: JAVA_VERSION
+        value: 21
